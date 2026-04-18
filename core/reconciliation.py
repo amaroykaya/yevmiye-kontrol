@@ -2,12 +2,14 @@ import logging
 import os
 import re
 from datetime import datetime
+from typing import Optional
 
 import pandas as pd
 from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from core.fis_summary import build_fis_summary_list
+from core.logger_setup import attach_run_file_log, detach_run_file_log
 from core.merge_excels import build_combined_rows, read_gelir_rows, read_gider_rows
 from core.yevmiye_parser import parse_fis_blocks
 
@@ -156,6 +158,24 @@ def _detect_month_from_filename(file_path: str) -> str | None:
             return month_num_map.get(month_num)
 
     return None
+
+
+def _resolve_ay_for_output(
+    yevmiye_file_path: str, gider_file_path: str, gelir_file_path: str
+) -> tuple[str, str]:
+    """Çıktı klasörü ve log dosya adı için ay adı ile kaynağını döndürür."""
+    ay_ismi = _detect_month_from_filename(yevmiye_file_path)
+    ay_kaynagi = "yevmiye"
+    if not ay_ismi:
+        ay_ismi = _detect_month_from_filename(gider_file_path)
+        ay_kaynagi = "gider"
+    if not ay_ismi:
+        ay_ismi = _detect_month_from_filename(gelir_file_path)
+        ay_kaynagi = "gelir"
+    if not ay_ismi:
+        ay_ismi = MONTH_NAMES_TR.get(datetime.now().month, "ay")
+        ay_kaynagi = "tarih"
+    return ay_ismi, ay_kaynagi
 
 
 def _to_float(value: object) -> float:
@@ -803,66 +823,73 @@ def run_reconciliation(
     output_dir: str,
     logger: logging.Logger,
 ) -> str:
-    logger.info("Seçilen yevmiye dosyası: %s", yevmiye_file_path)
-    logger.info("Seçilen gider dosyası: %s", gider_file_path)
-    logger.info("Seçilen gelir dosyası: %s", gelir_file_path)
-    logger.info("Seçilen çıktı klasörü: %s", output_dir)
-
-    muhasebe_rows = _build_muhasebe_rows(gider_file_path, gelir_file_path, logger)
-    yevmiye_rows = _build_yevmiye_rows(yevmiye_file_path, logger)
-    logger.info("Yevmiye satır sayısı: %s", len(yevmiye_rows))
-
-    matches, used_muhasebe_indexes = _match_rows(yevmiye_rows, muhasebe_rows, logger)
-    last_chance_matches = _last_chance_match(
-        yevmiye_rows=yevmiye_rows,
-        muhasebe_rows=muhasebe_rows,
-        matches=matches,
-        used_muhasebe_indexes=used_muhasebe_indexes,
-        logger=logger,
-    )
-    matches.update(last_chance_matches)
-    yevmiye_result, muhasebe_result = _compare(
-        yevmiye_rows, muhasebe_rows, matches, set(last_chance_matches.keys()), logger
-    )
-    yevmiye_result_sorted = _sort_yevmiye_rows_for_sheet(yevmiye_result)
-
-    logger.info("Birleşmiş excel toplam satır sayısı: %s", len(muhasebe_rows))
-    logger.info("2. sekmeye yazılan satır sayısı: %s", len(muhasebe_result))
-    logger.info("Yevmiye özet toplam satır sayısı: %s", len(yevmiye_rows))
-    logger.info("1. sekmeye yazılan satır sayısı: %s", len(yevmiye_result_sorted))
-
-    if len(muhasebe_rows) != len(muhasebe_result):
-        logger.warning(
-            "UYARI: Birleşik satır sayısı ile 2. sekme satır sayısı farklı! kaynak=%s sheet=%s",
-            len(muhasebe_rows),
-            len(muhasebe_result),
-        )
-    if len(yevmiye_rows) != len(yevmiye_result_sorted):
-        logger.warning(
-            "UYARI: Yevmiye satır sayısı ile 1. sekme satır sayısı farklı! kaynak=%s sheet=%s",
-            len(yevmiye_rows),
-            len(yevmiye_result_sorted),
-        )
-
     os.makedirs(output_dir, exist_ok=True)
-    ay_ismi = _detect_month_from_filename(yevmiye_file_path)
-    ay_kaynagi = "yevmiye"
-    if not ay_ismi:
-        ay_ismi = _detect_month_from_filename(gider_file_path)
-        ay_kaynagi = "gider"
-    if not ay_ismi:
-        ay_ismi = _detect_month_from_filename(gelir_file_path)
-        ay_kaynagi = "gelir"
-    if not ay_ismi:
-        ay_ismi = MONTH_NAMES_TR.get(datetime.now().month, "ay")
-        ay_kaynagi = "tarih"
+    ay_ismi, ay_kaynagi = _resolve_ay_for_output(
+        yevmiye_file_path, gider_file_path, gelir_file_path
+    )
+    kontrol_dir = os.path.join(output_dir, f"kontrol_{ay_ismi}")
+    os.makedirs(kontrol_dir, exist_ok=True)
+    run_log_path = os.path.join(kontrol_dir, f"log_{ay_ismi}.txt")
+    run_file_handler: Optional[logging.FileHandler] = None
+    try:
+        run_file_handler = attach_run_file_log(logger, run_log_path)
+        logger.info("Seçilen yevmiye dosyası: %s", yevmiye_file_path)
+        logger.info("Seçilen gider dosyası: %s", gider_file_path)
+        logger.info("Seçilen gelir dosyası: %s", gelir_file_path)
+        logger.info("Seçilen çıktı klasörü: %s", output_dir)
+        logger.info("Ay tespiti: %s kaynağından alındı (%s)", ay_kaynagi, ay_ismi)
+        logger.info("Kontrol çıktı klasörü: %s", kontrol_dir)
+        logger.info("Çalışma log dosyası: %s", run_log_path)
 
-    logger.info("Ay tespiti: %s kaynağından alındı (%s)", ay_kaynagi, ay_ismi)
-    output_path = os.path.join(output_dir, f"yevmiye_kontrol_{ay_ismi}.xlsx")
-    _write_yevmiye_ozet_excel(yevmiye_rows, output_dir, ay_ismi, logger)
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        _write_sheet(writer, "Yevmiye_Kontrol", yevmiye_result_sorted, logger)
-        _write_sheet(writer, "Birlestirilmis_Excel", muhasebe_result, logger)
+        muhasebe_rows = _build_muhasebe_rows(gider_file_path, gelir_file_path, logger)
+        yevmiye_rows = _build_yevmiye_rows(yevmiye_file_path, logger)
+        logger.info("Yevmiye satır sayısı: %s", len(yevmiye_rows))
 
-    logger.info("Kontrol çıktısı oluşturuldu: %s", output_path)
-    return output_path
+        matches, used_muhasebe_indexes = _match_rows(yevmiye_rows, muhasebe_rows, logger)
+        last_chance_matches = _last_chance_match(
+            yevmiye_rows=yevmiye_rows,
+            muhasebe_rows=muhasebe_rows,
+            matches=matches,
+            used_muhasebe_indexes=used_muhasebe_indexes,
+            logger=logger,
+        )
+        matches.update(last_chance_matches)
+        yevmiye_result, muhasebe_result = _compare(
+            yevmiye_rows, muhasebe_rows, matches, set(last_chance_matches.keys()), logger
+        )
+        yevmiye_result_sorted = _sort_yevmiye_rows_for_sheet(yevmiye_result)
+
+        logger.info("Birleşmiş excel toplam satır sayısı: %s", len(muhasebe_rows))
+        logger.info("2. sekmeye yazılan satır sayısı: %s", len(muhasebe_result))
+        logger.info("Yevmiye özet toplam satır sayısı: %s", len(yevmiye_rows))
+        logger.info("1. sekmeye yazılan satır sayısı: %s", len(yevmiye_result_sorted))
+
+        if len(muhasebe_rows) != len(muhasebe_result):
+            logger.warning(
+                "UYARI: Birleşik satır sayısı ile 2. sekme satır sayısı farklı! kaynak=%s sheet=%s",
+                len(muhasebe_rows),
+                len(muhasebe_result),
+            )
+        if len(yevmiye_rows) != len(yevmiye_result_sorted):
+            logger.warning(
+                "UYARI: Yevmiye satır sayısı ile 1. sekme satır sayısı farklı! kaynak=%s sheet=%s",
+                len(yevmiye_rows),
+                len(yevmiye_result_sorted),
+            )
+
+        _write_yevmiye_ozet_excel(yevmiye_rows, kontrol_dir, ay_ismi, logger)
+
+        detay_path = os.path.join(kontrol_dir, f"yevmiye_kontrol_detay_{ay_ismi}.xlsx")
+        with pd.ExcelWriter(detay_path, engine="openpyxl") as writer:
+            _write_sheet(writer, "Yevmiye_Kontrol", yevmiye_result_sorted, logger)
+        logger.info("ayrı dosya üretildi: yevmiye_kontrol_detay_%s.xlsx", ay_ismi)
+
+        birlesik_path = os.path.join(kontrol_dir, f"birlestirilmis_excel_{ay_ismi}.xlsx")
+        with pd.ExcelWriter(birlesik_path, engine="openpyxl") as writer:
+            _write_sheet(writer, "Birlestirilmis_Excel", muhasebe_result, logger)
+        logger.info("ayrı dosya üretildi: birlestirilmis_excel_%s.xlsx", ay_ismi)
+
+        return kontrol_dir
+    finally:
+        if run_file_handler is not None:
+            detach_run_file_log(logger, run_file_handler)

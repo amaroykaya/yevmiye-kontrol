@@ -177,17 +177,17 @@ class MainWindow:
             return
 
         try:
-            output_file = run_reconciliation(
+            kontrol_cikti_klasoru = run_reconciliation(
                 yevmiye_file_path=selected_yevmiye,
                 gider_file_path=selected_gider,
                 gelir_file_path=selected_gelir,
                 output_dir=selected_output_dir,
                 logger=self.logger,
             )
-            self.status_message.set("Durum: ✓ İşlem başarılı, kontrol dosyası oluşturuldu.")
+            self.status_message.set("Durum: ✓ İşlem başarılı, kontrol çıktıları oluşturuldu.")
             self.status_label.configure(foreground="#1E7A1E")
-            self.logger.info("Karşılaştırma tamamlandı: %s", output_file)
-            os.startfile(selected_output_dir)
+            self.logger.info("Karşılaştırma tamamlandı: %s", kontrol_cikti_klasoru)
+            os.startfile(kontrol_cikti_klasoru)
         except Exception as exc:
             self.logger.exception("Karşılaştırma sırasında hata oluştu: %s", exc)
             self.status_message.set("Durum: Hata oluştu. Logları kontrol edin.")
