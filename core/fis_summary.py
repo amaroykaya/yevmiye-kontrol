@@ -1,10 +1,24 @@
 import logging
 import re
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
 
-MAIN_ACCOUNT_PRIORITY = ["320", "120", "300", "100"]
+# 320/120/300/100 birincil; 102/770 banka ödemeli gider fişleri için yedek.
+MAIN_ACCOUNT_PRIORITY = [
+    "320",
+    "120",
+    "300",
+    "100",
+    "102",
+    "770",
+    "760",
+    "750",
+    "740",
+    "730",
+    "255",
+]
 LABEL_MAPPING = {
     "730.01": "ÜRETİM",
     "750.30": "ANTEN",
@@ -12,7 +26,12 @@ LABEL_MAPPING = {
     "770.10": "GENEL",
     "750.20": "SAVUNMA",
 }
-DEFAULT_YEAR = "2026"
+
+
+def _default_year() -> str:
+    return str(datetime.now().year)
+
+
 SUPPORTED_DOC_TYPES = ["EF", "FT", "EA", "PO", "FŞ", "FS", "SM", "DK"]
 DOCUMENT_LINE_REGEX = re.compile(
     r"^\s*(EF|FT|EA|PO|FŞ|FS|SM|DK)\s+(\S+)(?:\s+(\d{2}[./-]\d{2}))?(?:\s+(.*))?$",
@@ -85,7 +104,7 @@ def _extract_year_from_source(fis_df: pd.DataFrame, file_path: str) -> str:
     if match:
         return match.group(1)
 
-    return DEFAULT_YEAR
+    return _default_year()
 
 
 def parse_document_line(text: str | None) -> dict | None:
@@ -108,18 +127,34 @@ def parse_document_line(text: str | None) -> dict | None:
     }
 
 
-def find_best_document_info(fis_df: pd.DataFrame) -> dict:
+def _collect_document_candidates(fis_df: pd.DataFrame) -> list[dict]:
     candidates: list[dict] = []
-
     for _, row in fis_df.iterrows():
         text = str(row.get("aciklama", "")).strip()
         parsed = parse_document_line(text)
-        if not parsed:
-            continue
-        candidates.append(parsed)
+        if parsed:
+            candidates.append(parsed)
+    return candidates
 
+
+def find_best_document_info(fis_df: pd.DataFrame) -> dict:
+    candidates = _collect_document_candidates(fis_df)
     if not candidates:
-        return {"belge_tipi": "YOK", "fatura_no": "", "kisa_tarih": "", "firma": ""}
+        return {
+            "belge_tipi": "YOK",
+            "fatura_no": "",
+            "kisa_tarih": "",
+            "firma": "",
+            "_belge_aday_sayisi": 0,
+            "_cok_belgeli": False,
+        }
+
+    unique_faturas = {
+        (c.get("belge_tipi", ""), str(c.get("fatura_no", "")).strip().upper())
+        for c in candidates
+        if str(c.get("fatura_no", "")).strip()
+    }
+    cok_belgeli = len(unique_faturas) > 1
 
     def candidate_key(item: dict) -> tuple[int, int]:
         has_firma = 1 if item.get("firma", "").strip() else 0
@@ -127,26 +162,56 @@ def find_best_document_info(fis_df: pd.DataFrame) -> dict:
         return has_firma, firma_len
 
     best = max(candidates, key=candidate_key)
+    best = dict(best)
+    best["_belge_aday_sayisi"] = len(candidates)
+    best["_cok_belgeli"] = cok_belgeli
+    best["_benzersiz_fatura_sayisi"] = len(unique_faturas)
     return best
+
+
+def _header_from_fis(fis_df: pd.DataFrame) -> dict | None:
+    header = getattr(fis_df, "attrs", {}).get("fis_header")
+    if isinstance(header, dict) and header.get("tarih"):
+        return header
+    if fis_df.empty:
+        return None
+    from core.yevmiye_parser import parse_fis_header
+
+    for column in ["hesap_kodu", "hesap_adi", "aciklama"]:
+        parsed = parse_fis_header(fis_df.iloc[0].get(column, ""))
+        if parsed:
+            return parsed
+    return None
 
 
 def _extract_date(fis_df: pd.DataFrame, file_path: str, doc_info: dict) -> str:
     if fis_df.empty:
         return ""
 
-    first_row_text = _row_combined_text(fis_df.iloc[0])
+    header = _header_from_fis(fis_df)
+    if header and header.get("tarih"):
+        return str(header["tarih"])
 
+    first_row_text = _row_combined_text(fis_df.iloc[0])
     full_date_match = re.search(r"(\d{2})[./-](\d{2})[./-](\d{4})", first_row_text)
     if full_date_match:
         day, month, year = full_date_match.groups()
         return f"{day}.{month}.{year}"
 
     year = _extract_year_from_source(fis_df, file_path)
-    if doc_info["kisa_tarih"]:
+    if doc_info.get("kisa_tarih"):
         day, month = doc_info["kisa_tarih"].split("/")
         return f"{day}.{month}.{year}"
 
     return ""
+
+
+def _fis_has_account_prefix(fis_df: pd.DataFrame, prefix: str) -> bool:
+    for value in fis_df["hesap_kodu"].tolist():
+        code = str(value).strip()
+        if code.startswith(prefix):
+            return True
+    return False
 
 
 def _extract_main_account(fis_df: pd.DataFrame) -> str:
@@ -194,7 +259,7 @@ def _extract_company_name_from_accounts(fis_df: pd.DataFrame) -> str:
         hesap_adi = str(row.get("hesap_adi", "")).strip()
         if not code or not hesap_adi:
             continue
-        if not (code.startswith("320") or code.startswith("120") or code.startswith("300") or code.startswith("100")):
+        if not (code.startswith("320") or code.startswith("120") or code.startswith("300") or code.startswith("100") or code.startswith("102")):
             continue
         if not _is_detail_row(code, str(row.get("aciklama", ""))):
             continue
@@ -300,7 +365,12 @@ def _extract_toplam_from_total_row(fis_df: pd.DataFrame) -> tuple[float, str]:
 
 
 def _extract_toplam_fallback(fis_df: pd.DataFrame, main_account: str) -> tuple[float, str]:
-    fallback_codes = ["120"] if main_account == "120" else ["320", "300", "100"]
+    if main_account == "120":
+        fallback_codes = ["120"]
+    elif main_account in {"102", "100"}:
+        fallback_codes = [main_account, "770", "760", "750"]
+    else:
+        fallback_codes = ["320", "300", "100", "102"]
     for code_prefix in fallback_codes:
         for _, row in fis_df.iterrows():
             code = str(row.get("hesap_kodu", "")).strip()
@@ -331,7 +401,7 @@ def _extract_etiket(fis_df: pd.DataFrame, main_account: str) -> str:
         for keyword, label in LABEL_KEYWORDS.items():
             if keyword in hesap_adi:
                 return label
-    if main_account in {"300", "320"}:
+    if main_account in {"300", "320", "102", "770"}:
         return "GENEL"
     return ""
 
@@ -339,6 +409,7 @@ def _extract_etiket(fis_df: pd.DataFrame, main_account: str) -> str:
 def extract_fis_summary(fis_df: pd.DataFrame, index: int, file_path: str) -> dict:
     main_account = _extract_main_account(fis_df)
     doc_info = find_best_document_info(fis_df)
+    header = _header_from_fis(fis_df)
     tarih = _extract_date(fis_df, file_path, doc_info)
     firma, fallback_firma = _extract_company_name(fis_df, doc_info)
 
@@ -354,6 +425,9 @@ def extract_fis_summary(fis_df: pd.DataFrame, index: int, file_path: str) -> dic
         mal_hizmet = 0.0
     mal_hizmet = round(mal_hizmet, 2)
     etiket = _extract_etiket(fis_df, main_account)
+    has_360 = _fis_has_account_prefix(fis_df, "360")
+    # Tevkifat: 360 (sorumlu sifariş KDV) + indirilecek KDV satırı birlikte.
+    tevkifatli = has_360 and kdv > 0
 
     return {
         "sira_no": index,
@@ -372,6 +446,13 @@ def extract_fis_summary(fis_df: pd.DataFrame, index: int, file_path: str) -> dic
         "_belge_satiri_bulundu": doc_info.get("belge_tipi", "YOK") != "YOK",
         "_fallback_firma": fallback_firma,
         "_kisa_tarih": doc_info.get("kisa_tarih", ""),
+        "_fis_no_bas": (header or {}).get("fis_no_bas", ""),
+        "_fis_no_bit": (header or {}).get("fis_no_bit", ""),
+        "_fis_tipi": (header or {}).get("fis_tipi", ""),
+        "_has_360": has_360,
+        "_tevkifatli": tevkifatli,
+        "_cok_belgeli": bool(doc_info.get("_cok_belgeli", False)),
+        "_benzersiz_fatura_sayisi": int(doc_info.get("_benzersiz_fatura_sayisi", 0) or 0),
     }
 
 
@@ -393,11 +474,24 @@ def build_fis_summary_list(
     belge_bulunamayan = len(summaries) - belge_bulunan
     fallback_firma_sayisi = sum(1 for s in summaries if s.get("_fallback_firma", False))
     fatura_bos_sayisi = sum(1 for s in summaries if not s.get("fatura_no", "").strip())
+    hesap_bos_sayisi = sum(1 for s in summaries if not str(s.get("hesap_kodu", "")).strip())
+    tevkifat_sayisi = sum(1 for s in summaries if s.get("_tevkifatli"))
+    cok_belgeli = [s for s in summaries if s.get("_cok_belgeli")]
 
     logger.info("Belge satırı bulunan fiş sayısı: %s", belge_bulunan)
     logger.info("Belge satırı bulunamayan fiş sayısı: %s", belge_bulunamayan)
     logger.info("Firma fallback ile doldurulan fiş sayısı: %s", fallback_firma_sayisi)
     logger.info("Fatura_no boş kalan fiş sayısı: %s", fatura_bos_sayisi)
+    logger.info("Hesap_kodu boş kalan fiş sayısı: %s", hesap_bos_sayisi)
+    logger.info("Tevkifatlı (360+KDV) fiş sayısı: %s", tevkifat_sayisi)
+    logger.info("Çok belgeli fiş sayısı: %s", len(cok_belgeli))
+    for s in cok_belgeli[:20]:
+        logger.warning(
+            "Çok belgeli fiş uyarısı: Fiş %s | seçilen_fatura=%s | benzersiz_fatura=%s",
+            s["sira_no"],
+            s.get("fatura_no", ""),
+            s.get("_benzersiz_fatura_sayisi", 0),
+        )
 
     if summaries:
         first = summaries[0]

@@ -1,16 +1,23 @@
 import logging
 import os
+import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, ttk
 
-from core.reconciliation import run_reconciliation
+from core.reconciliation import ReconciliationResult, run_reconciliation
+
+EXCEL_FILETYPES = [
+    ("Excel dosyaları", "*.xlsx *.xlsm *.xls"),
+    ("Tüm dosyalar", "*.*"),
+]
 
 
 class MainWindow:
     def __init__(self, root: tk.Tk, logger: logging.Logger) -> None:
         self.root = root
         self.logger = logger
+        self._busy = False
 
         self.selected_yevmiye_file = tk.StringVar(value="Henüz yevmiye dosyası seçilmedi.")
         self.selected_gider_file = tk.StringVar(value="Henüz gider dosyası seçilmedi.")
@@ -23,8 +30,8 @@ class MainWindow:
 
     def _configure_window(self) -> None:
         self.root.title("Yevmiye Kontrol")
-        self.root.geometry("760x430")
-        self.root.minsize(760, 430)
+        self.root.geometry("760x450")
+        self.root.minsize(760, 450)
         self.root.columnconfigure(0, weight=1)
 
     def _create_widgets(self) -> None:
@@ -62,7 +69,7 @@ class MainWindow:
 
         gelir_button = ttk.Button(
             container,
-            text="Gelirler Excel Seç",
+            text="Gelirler Excel Seç (opsiyonel)",
             command=self.select_gelir_file,
         )
         gelir_button.grid(row=4, column=0, sticky="w")
@@ -88,14 +95,17 @@ class MainWindow:
         )
         output_label.grid(row=7, column=0, sticky="w", pady=(8, 16))
 
-        start_button = ttk.Button(container, text="Başlat", command=self.start_process)
-        start_button.grid(row=8, column=0, sticky="w")
+        self.start_button = ttk.Button(container, text="Başlat", command=self.start_process)
+        self.start_button.grid(row=8, column=0, sticky="w")
 
         self.status_label = ttk.Label(container, textvariable=self.status_message, foreground="#222222")
         self.status_label.grid(row=9, column=0, sticky="w", pady=(24, 0))
 
     def select_yevmiye_file(self) -> None:
-        file_path = filedialog.askopenfilename(title="Yevmiye Excel Seç")
+        file_path = filedialog.askopenfilename(
+            title="Yevmiye Excel Seç",
+            filetypes=EXCEL_FILETYPES,
+        )
         if not file_path:
             self.status_message.set("Durum: Yevmiye dosya seçimi iptal edildi.")
             self.logger.info("Yevmiye dosya seçimi iptal edildi.")
@@ -108,7 +118,10 @@ class MainWindow:
         self.logger.info("Yevmiye dosyası seçildi: %s", normalized_path)
 
     def select_gider_file(self) -> None:
-        file_path = filedialog.askopenfilename(title="Giderler Excel Seç")
+        file_path = filedialog.askopenfilename(
+            title="Giderler Excel Seç",
+            filetypes=EXCEL_FILETYPES,
+        )
         if not file_path:
             self.status_message.set("Durum: Gider dosya seçimi iptal edildi.")
             self.logger.info("Gider dosya seçimi iptal edildi.")
@@ -121,7 +134,10 @@ class MainWindow:
         self.logger.info("Gider dosyası seçildi: %s", normalized_path)
 
     def select_gelir_file(self) -> None:
-        file_path = filedialog.askopenfilename(title="Gelirler Excel Seç")
+        file_path = filedialog.askopenfilename(
+            title="Gelirler Excel Seç",
+            filetypes=EXCEL_FILETYPES,
+        )
         if not file_path:
             self.status_message.set("Durum: Gelir dosya seçimi iptal edildi.")
             self.logger.info("Gelir dosya seçimi iptal edildi.")
@@ -148,6 +164,8 @@ class MainWindow:
 
     def start_process(self) -> None:
         self.logger.info("Başlat butonuna tıklandı.")
+        if self._busy:
+            return
 
         selected_yevmiye = self.selected_yevmiye_file.get().strip()
         if not selected_yevmiye or selected_yevmiye == "Henüz yevmiye dosyası seçilmedi.":
@@ -165,10 +183,7 @@ class MainWindow:
 
         selected_gelir = self.selected_gelir_file.get().strip()
         if not selected_gelir or selected_gelir == "Henüz gelir dosyası seçilmedi.":
-            self.status_message.set("Durum: Lütfen önce gelir dosyasını seçin.")
-            self.status_label.configure(foreground="#B00020")
-            self.logger.warning("Başlat iptal: Gelir dosyası seçilmedi.")
-            return
+            selected_gelir = ""
         selected_output_dir = self.selected_output_dir.get().strip()
         if not selected_output_dir or selected_output_dir == "Henüz klasör seçilmedi.":
             self.status_message.set("Durum: Lütfen önce çıktı klasörü seçin.")
@@ -176,19 +191,61 @@ class MainWindow:
             self.logger.warning("Başlat iptal: Çıktı klasörü seçilmedi.")
             return
 
+        self._busy = True
+        self.start_button.configure(state="disabled")
+        self.status_message.set("Durum: İşleniyor…")
+        self.status_label.configure(foreground="#222222")
+
+        thread = threading.Thread(
+            target=self._run_reconciliation_worker,
+            args=(
+                selected_yevmiye,
+                selected_gider,
+                selected_gelir or None,
+                selected_output_dir,
+            ),
+            daemon=True,
+        )
+        thread.start()
+
+    def _run_reconciliation_worker(
+        self,
+        yevmiye: str,
+        gider: str,
+        gelir: str | None,
+        output_dir: str,
+    ) -> None:
         try:
-            kontrol_cikti_klasoru = run_reconciliation(
-                yevmiye_file_path=selected_yevmiye,
-                gider_file_path=selected_gider,
-                gelir_file_path=selected_gelir,
-                output_dir=selected_output_dir,
+            result = run_reconciliation(
+                yevmiye_file_path=yevmiye,
+                gider_file_path=gider,
+                gelir_file_path=gelir,
+                output_dir=output_dir,
                 logger=self.logger,
             )
-            self.status_message.set("Durum: ✓ İşlem başarılı, kontrol çıktıları oluşturuldu.")
-            self.status_label.configure(foreground="#1E7A1E")
-            self.logger.info("Karşılaştırma tamamlandı: %s", kontrol_cikti_klasoru)
-            os.startfile(kontrol_cikti_klasoru)
+            self.root.after(0, lambda: self._on_success(result))
         except Exception as exc:
             self.logger.exception("Karşılaştırma sırasında hata oluştu: %s", exc)
-            self.status_message.set("Durum: Hata oluştu. Logları kontrol edin.")
-            self.status_label.configure(foreground="#B00020")
+            self.root.after(0, lambda: self._on_error(str(exc)))
+
+    def _on_success(self, result: ReconciliationResult) -> None:
+        self._busy = False
+        self.start_button.configure(state="normal")
+        self.status_message.set(
+            f"Durum: ✓ TAM={result.tam_uyumlu} | TEVKIFAT={result.tevkifat_uyumlu} | "
+            f"ISTISNA={result.istisna_uyumlu} | FARK={result.fark_var} | "
+            f"YOK(y)={result.eslesme_yok_yevmiye} YOK(x)={result.eslesme_yok_muhasebe} | "
+            f"uyum %{result.birebir_orani}"
+        )
+        self.status_label.configure(foreground="#1E7A1E")
+        self.logger.info("Karşılaştırma tamamlandı: %s", result.output_dir)
+        try:
+            os.startfile(result.output_dir)
+        except OSError as exc:
+            self.logger.warning("Çıktı klasörü açılamadı: %s", exc)
+
+    def _on_error(self, _message: str) -> None:
+        self._busy = False
+        self.start_button.configure(state="normal")
+        self.status_message.set("Durum: Hata oluştu. Logları kontrol edin.")
+        self.status_label.configure(foreground="#B00020")

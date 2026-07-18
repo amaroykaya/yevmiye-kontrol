@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
@@ -14,8 +15,43 @@ from core.merge_excels import build_combined_rows, read_gelir_rows, read_gider_r
 from core.yevmiye_parser import parse_fis_blocks
 
 STATUS_TAM = "TAM_UYUMLU"
+STATUS_TEVKIFAT = "TEVKIFAT_UYUMLU"
+STATUS_ISTISNA = "ISTISNA_UYUMLU"
 STATUS_FARK = "FARK_VAR"
 STATUS_YOK = "ESLESME_YOK"
+
+UYUMLU_STATUSES = {STATUS_TAM, STATUS_TEVKIFAT, STATUS_ISTISNA}
+
+# Soft / son-şans eşleşmelerde yanlış pozitif riskini azaltmak için alt sınırlar.
+SOFT_MATCH_MIN_FATURA_LEN = 4
+LAST_CHANCE_TAIL_LEN = 4
+AMOUNT_TOLERANCE = 1.0
+
+
+@dataclass
+class ReconciliationResult:
+    """Tek bir karşılaştırma çalışmasının özeti."""
+
+    output_dir: str
+    ay_ismi: str
+    yevmiye_count: int
+    muhasebe_count: int
+    tam_uyumlu: int
+    tevkifat_uyumlu: int
+    istisna_uyumlu: int
+    fark_var: int
+    eslesme_yok_yevmiye: int
+    eslesme_yok_muhasebe: int
+
+    @property
+    def uyumlu_toplam(self) -> int:
+        return self.tam_uyumlu + self.tevkifat_uyumlu + self.istisna_uyumlu
+
+    @property
+    def birebir_orani(self) -> float:
+        if self.yevmiye_count <= 0:
+            return 0.0
+        return round(100.0 * self.uyumlu_toplam / self.yevmiye_count, 1)
 
 FILL_GREEN = PatternFill(fill_type="solid", start_color="C6EFCE", end_color="C6EFCE")
 FILL_YELLOW = PatternFill(fill_type="solid", start_color="FFF2CC", end_color="FFF2CC")
@@ -60,11 +96,13 @@ def _norm_text(value: object) -> str:
     return " ".join(text.split()).lower()
 
 
-def _normalize_fatura_no(value: object) -> str:
+def _normalize_fatura_no(value: object) -> str | None:
     if value is None:
         return None
 
     s = str(value).upper().strip()
+    if not s or s.lower() == "nan":
+        return None
 
     # özel karakterleri sil
     s = re.sub(r"[\s\-\./,]", "", s)
@@ -161,7 +199,7 @@ def _detect_month_from_filename(file_path: str) -> str | None:
 
 
 def _resolve_ay_for_output(
-    yevmiye_file_path: str, gider_file_path: str, gelir_file_path: str
+    yevmiye_file_path: str, gider_file_path: str, gelir_file_path: str | None
 ) -> tuple[str, str]:
     """Çıktı klasörü ve log dosya adı için ay adı ile kaynağını döndürür."""
     ay_ismi = _detect_month_from_filename(yevmiye_file_path)
@@ -169,7 +207,7 @@ def _resolve_ay_for_output(
     if not ay_ismi:
         ay_ismi = _detect_month_from_filename(gider_file_path)
         ay_kaynagi = "gider"
-    if not ay_ismi:
+    if not ay_ismi and gelir_file_path:
         ay_ismi = _detect_month_from_filename(gelir_file_path)
         ay_kaynagi = "gelir"
     if not ay_ismi:
@@ -198,13 +236,18 @@ def _to_float(value: object) -> float:
 
 
 def _is_prefix_match(left: str | None, right: str | None) -> bool:
+    """Kısa fatura no'larda yanlış eşleşmeyi engelleyen prefix kontrolü."""
     if not left or not right:
+        return False
+    if left == right:
+        return True
+    if min(len(left), len(right)) < SOFT_MATCH_MIN_FATURA_LEN:
         return False
     return left.startswith(right) or right.startswith(left)
 
 
 def _status_fill(status: str) -> PatternFill:
-    if status == STATUS_TAM:
+    if status in UYUMLU_STATUSES:
         return FILL_GREEN
     if status == STATUS_FARK:
         return FILL_YELLOW
@@ -228,6 +271,10 @@ def _build_yevmiye_rows(yevmiye_file_path: str, logger: logging.Logger) -> list[
                 "Etiket": item.get("etiket", ""),
                 "Ödeme Kanalı": "",
                 "_hesap_kodu": str(item.get("hesap_kodu", "")),
+                "_mal_hizmet": _to_float(item.get("mal_hizmet", 0)),
+                "_tevkifatli": bool(item.get("_tevkifatli", False)),
+                "_has_360": bool(item.get("_has_360", False)),
+                "_cok_belgeli": bool(item.get("_cok_belgeli", False)),
             }
         )
     return rows
@@ -280,9 +327,17 @@ def _write_yevmiye_ozet_excel(
     return output_path
 
 
-def _build_muhasebe_rows(gider_file_path: str, gelir_file_path: str, logger: logging.Logger) -> list[dict]:
+def _build_muhasebe_rows(
+    gider_file_path: str,
+    gelir_file_path: str | None,
+    logger: logging.Logger,
+) -> list[dict]:
     gider_rows = read_gider_rows(gider_file_path, logger)
-    gelir_rows = read_gelir_rows(gelir_file_path, logger)
+    gelir_rows: list[dict] = []
+    if gelir_file_path:
+        gelir_rows = read_gelir_rows(gelir_file_path, logger)
+    else:
+        logger.info("Gelir dosyası seçilmedi; yalnızca gider satırları kullanılacak.")
     logger.info("Gider satır sayısı: %s", len(gider_rows))
     logger.info("Gelir satır sayısı: %s", len(gelir_rows))
     combined = build_combined_rows(gider_rows, gelir_rows)
@@ -371,7 +426,7 @@ def _match_rows(
             if not _is_prefix_match(normalized_fatura, m_norm_fatura):
                 continue
             m_toplam = _to_float(m_row.get("Toplam", 0))
-            if abs(y_toplam - m_toplam) <= 1:
+            if abs(y_toplam - m_toplam) <= AMOUNT_TOLERANCE:
                 soft_candidates.append(mi)
 
         if len(soft_candidates) == 1:
@@ -412,7 +467,7 @@ def _match_rows(
             if _norm_text(m_row.get("Firma", "")) != y_firma:
                 continue
             m_toplam = _to_float(m_row.get("Toplam", 0))
-            if abs(y_toplam - m_toplam) <= 1:
+            if abs(y_toplam - m_toplam) <= AMOUNT_TOLERANCE:
                 fallback_candidates.append(mi)
 
         best_idx = pick_best(fallback_candidates, y_row)
@@ -439,8 +494,8 @@ def _last_chance_match(
     """
     Son şans eşleşme:
     - Sadece normal akışta eşleşmeyen satırlar arasında çalışır
-    - Toplam farkı ±1
-    - Normalize fatura no son 3 veya 4 hanesi aynı
+    - Toplam farkı ±AMOUNT_TOLERANCE
+    - Normalize fatura no son 4 hanesi aynı (3 hane yanlış pozitif üretir)
     """
     extra_matches: dict[int, int] = {}
 
@@ -450,11 +505,8 @@ def _last_chance_match(
     def tail_match(a: str | None, b: str | None) -> bool:
         if not a or not b:
             return False
-        if len(a) >= 4 and len(b) >= 4 and a[-4:] == b[-4:]:
-            return True
-        if len(a) >= 3 and len(b) >= 3 and a[-3:] == b[-3:]:
-            return True
-        return False
+        n = LAST_CHANCE_TAIL_LEN
+        return len(a) >= n and len(b) >= n and a[-n:] == b[-n:]
 
     for yi in unmatched_yevmiye:
         y_row = yevmiye_rows[yi]
@@ -473,7 +525,7 @@ def _last_chance_match(
             m_toplam = _to_float(m_row.get("Toplam", 0))
             if not tail_match(y_fatura, m_fatura):
                 continue
-            if abs(y_toplam - m_toplam) <= 1:
+            if abs(y_toplam - m_toplam) <= AMOUNT_TOLERANCE:
                 candidates.append(mi)
 
         if not candidates:
@@ -554,7 +606,7 @@ def _analyze_unmatched_reason(
     total_near_candidates = []
     for idx, c_row in enumerate(counterpart_rows):
         c_toplam = _to_float(c_row.get("Toplam", 0))
-        if abs(toplam - c_toplam) <= 1:
+        if abs(toplam - c_toplam) <= AMOUNT_TOLERANCE:
             total_near_candidates.append(idx)
 
     if total_near_candidates:
@@ -607,20 +659,163 @@ def _analyze_unmatched_reason(
     return "fatura no bulunamadı"
 
 
+def _evaluate_match(
+    y_row: dict,
+    m_row: dict,
+    *,
+    is_last_chance: bool,
+) -> tuple[str, str, bool, bool, bool, bool, bool, float, float]:
+    """
+    Eşleşen satır çifti için durum üretir.
+    - TAM_UYUMLU: fatura birebir + toplam/KDV/etiket
+    - TEVKIFAT_UYUMLU: Excel KDV 0, yevmiye KDV>0 (360), mal≈Excel toplam
+    - ISTISNA_UYUMLU: gelir KDV 0 ve tutarlar uyumlu
+    Soft / son-şans en fazla FARK_VAR olur.
+    """
+    y_kdv = _to_float(y_row.get("KDV", 0))
+    m_kdv = _to_float(m_row.get("KDV", 0))
+    y_toplam = _to_float(y_row.get("Toplam", 0))
+    m_toplam = _to_float(m_row.get("Toplam", 0))
+    y_mal = _to_float(y_row.get("_mal_hizmet", y_row.get("KDV'siz", 0)))
+    m_kdvsiz = _to_float(m_row.get("KDV'siz", 0))
+
+    y_etiket = str(y_row.get("Etiket", "")).strip()
+    m_etiket = str(m_row.get("Etiket", "")).strip()
+    etiket_ok = (not y_etiket and not m_etiket) or (y_etiket == m_etiket)
+    fatura_ok = _normalize_fatura_no(y_row.get("Fatura No", "")) == _normalize_fatura_no(
+        m_row.get("Fatura No", "")
+    )
+    firma_ok = _normalize_firma(y_row.get("Firma", "")) == _normalize_firma(m_row.get("Firma", ""))
+
+    # --- Tevkifat: Excel KDV yok, yevmiyede KDV (KDV 2) var; mal/hizmet Excel toplamına eşit ---
+    tevkifat_excel = bool(m_row.get("_tevkifat_aday")) or (
+        abs(m_kdv) <= AMOUNT_TOLERANCE and abs(m_toplam - m_kdvsiz) <= AMOUNT_TOLERANCE
+    )
+    tevkifat_yevmiye = bool(y_row.get("_tevkifatli")) or (
+        bool(y_row.get("_has_360")) and y_kdv > AMOUNT_TOLERANCE
+    )
+    mal_vs_excel = abs(y_mal - m_toplam) <= AMOUNT_TOLERANCE
+    is_tevkifat = (
+        fatura_ok
+        and not is_last_chance
+        and tevkifat_excel
+        and tevkifat_yevmiye
+        and mal_vs_excel
+        and etiket_ok
+    )
+
+    # --- Gelir istisna: Excel KDV 0, yevmiye de KDV 0 (veya ihmal), toplam uyumlu ---
+    is_gelir = str(m_row.get("_kaynak", "")).lower() == "gelir" or bool(m_row.get("_istisna_aday"))
+    is_istisna = (
+        fatura_ok
+        and not is_last_chance
+        and is_gelir
+        and abs(m_kdv) <= AMOUNT_TOLERANCE
+        and abs(y_toplam - m_toplam) <= AMOUNT_TOLERANCE
+        and (abs(y_kdv) <= AMOUNT_TOLERANCE or abs(y_mal - m_toplam) <= AMOUNT_TOLERANCE)
+        and etiket_ok
+    )
+
+    if is_tevkifat:
+        toplam_ok = True
+        kdv_ok = True
+        kdv_special = True
+        toplam_fark = abs(y_mal - m_toplam)
+        kdv_fark = abs(y_kdv - m_kdv)
+        note = "tevkifat; Excel KDV 0, yevmiye KDV (KDV 2/%20) — mal/hizmet uyumlu"
+        if not firma_ok:
+            note += "; firma yazımı farklı"
+        if y_row.get("_cok_belgeli"):
+            note += "; çok belgeli fiş (uyarı)"
+        return STATUS_TEVKIFAT, note, fatura_ok, firma_ok, toplam_ok, kdv_ok, kdv_special, toplam_fark, kdv_fark
+
+    if is_istisna and abs(m_kdv) <= AMOUNT_TOLERANCE and abs(y_kdv) <= AMOUNT_TOLERANCE:
+        toplam_ok = True
+        kdv_ok = True
+        kdv_special = False
+        toplam_fark = abs(y_toplam - m_toplam)
+        kdv_fark = abs(y_kdv - m_kdv)
+        note = "KDV istisnası / teknopark; KDV 0 uyumlu"
+        if not firma_ok:
+            note += "; firma yazımı farklı"
+        return STATUS_ISTISNA, note, fatura_ok, firma_ok, toplam_ok, kdv_ok, kdv_special, toplam_fark, kdv_fark
+
+    # Standart kıyas
+    toplam_fark = abs(y_toplam - m_toplam)
+    kdv_fark = abs(y_kdv - m_kdv)
+    toplam_ok = toplam_fark <= AMOUNT_TOLERANCE
+    kdv_ok = kdv_fark <= AMOUNT_TOLERANCE
+    kdv_special = m_kdv == 0 and y_kdv > 0 and toplam_ok
+
+    # Tevkifat adayı ama 360/mal eşleşmedi → toplamı mal üzerinden de dene (açıklayıcı fark)
+    if tevkifat_excel and y_kdv > AMOUNT_TOLERANCE and mal_vs_excel and not toplam_ok:
+        toplam_ok = True
+        toplam_fark = abs(y_mal - m_toplam)
+        # KDV hâlâ fark; tevkifat yevmiye bayrağı yoksa FARK kalır ama not netleşir
+
+    reasons: list[str] = []
+    if is_last_chance:
+        reasons.append("son hane eşleşmesi ile bulundu")
+    if not fatura_ok:
+        reasons.append("fatura no birebir değil")
+    if not toplam_ok:
+        reasons.append("toplam farkı")
+    if tevkifat_excel and y_kdv > AMOUNT_TOLERANCE and mal_vs_excel:
+        reasons.append("tevkifat adayı (360/mal kontrolü tam değil)")
+    elif kdv_special:
+        reasons.append("yevmiye tarafında kısmi/ek KDV var")
+    elif not kdv_ok:
+        reasons.append("KDV farkı")
+    if not etiket_ok:
+        reasons.append("etiket farkı")
+    if not firma_ok:
+        reasons.append("firma yazımı farklı")
+    if y_row.get("_cok_belgeli"):
+        reasons.append("çok belgeli fiş")
+
+    if fatura_ok and toplam_ok and kdv_ok and etiket_ok and not is_last_chance:
+        status = STATUS_TAM
+        note = "Tüm kontroller uyumlu" if firma_ok else "Tutarlar uyumlu; firma yazımı farklı"
+    else:
+        status = STATUS_FARK
+        note = ", ".join(reasons) if reasons else "Kontrol farkı var"
+
+    return status, note, fatura_ok, firma_ok, toplam_ok, kdv_ok, kdv_special, toplam_fark, kdv_fark
+
+
 def _compare(
     yevmiye_rows: list[dict],
     muhasebe_rows: list[dict],
     matches: dict[int, int],
     last_chance_match_keys: set[int],
     logger: logging.Logger,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], dict[str, int]]:
     yevmiye_result: list[dict] = []
     muhasebe_result: list[dict] = []
 
     matched_muhasebe = {mi: yi for yi, mi in matches.items()}
     tam_count = 0
+    tevkifat_count = 0
+    istisna_count = 0
     fark_count = 0
     yok_count = 0
+    muhasebe_yok_count = 0
+
+    def _kdv_label(status: str, kdv_ok: bool, kdv_special: bool, kdv_fark: float) -> str:
+        if status == STATUS_TEVKIFAT:
+            return "TEVKIFAT"
+        if status == STATUS_ISTISNA:
+            return "ISTISNA"
+        if kdv_special:
+            return "KISMI_KDV"
+        if kdv_ok:
+            return "UYUMLU"
+        return f"FARK ({kdv_fark:.2f})"
+
+    def _etiket_ok(y_row: dict, m_row: dict) -> bool:
+        y_etiket = str(y_row.get("Etiket", "")).strip()
+        m_etiket = str(m_row.get("Etiket", "")).strip()
+        return (not y_etiket and not m_etiket) or (y_etiket == m_etiket)
 
     for yi, y_row in enumerate(yevmiye_rows):
         if yi not in matches:
@@ -634,41 +829,16 @@ def _compare(
 
         mi = matches[yi]
         m_row = muhasebe_rows[mi]
-        toplam_fark = abs(_to_float(y_row.get("Toplam", 0)) - _to_float(m_row.get("Toplam", 0)))
-        kdv_fark = abs(_to_float(y_row.get("KDV", 0)) - _to_float(m_row.get("KDV", 0)))
-
-        toplam_ok = toplam_fark <= 1
-        kdv_ok = kdv_fark <= 1
-        y_kdv = _to_float(y_row.get("KDV", 0))
-        m_kdv = _to_float(m_row.get("KDV", 0))
-        kdv_special = m_kdv == 0 and y_kdv > 0 and toplam_ok
-
-        y_etiket = str(y_row.get("Etiket", "")).strip()
-        m_etiket = str(m_row.get("Etiket", "")).strip()
-        etiket_ok = (not y_etiket and not m_etiket) or (y_etiket == m_etiket)
-        fatura_ok = _normalize_fatura_no(y_row.get("Fatura No", "")) == _normalize_fatura_no(m_row.get("Fatura No", ""))
-        firma_ok = _normalize_firma(y_row.get("Firma", "")) == _normalize_firma(m_row.get("Firma", ""))
-
-        if yi in last_chance_match_keys:
-            status = STATUS_FARK
-            note = "son hane eşleşmesi ile bulundu"
-            fark_count += 1
-        elif toplam_ok and kdv_ok and etiket_ok:
-            status = STATUS_TAM
-            note = "Tüm kontroller uyumlu"
+        status, note, fatura_ok, firma_ok, toplam_ok, kdv_ok, kdv_special, toplam_fark, kdv_fark = (
+            _evaluate_match(y_row, m_row, is_last_chance=yi in last_chance_match_keys)
+        )
+        if status == STATUS_TAM:
             tam_count += 1
+        elif status == STATUS_TEVKIFAT:
+            tevkifat_count += 1
+        elif status == STATUS_ISTISNA:
+            istisna_count += 1
         else:
-            status = STATUS_FARK
-            reasons = []
-            if not toplam_ok:
-                reasons.append("toplam farkı")
-            if kdv_special:
-                reasons.append("yevmiye tarafında kısmi/ek KDV var")
-            elif not kdv_ok:
-                reasons.append("KDV farkı")
-            if not etiket_ok:
-                reasons.append("etiket farkı")
-            note = ", ".join(reasons)
             fark_count += 1
             logger.info(
                 "Eşleşme farkı (sarı): Yevmiye %s -> Muhasebe %s | neden=%s",
@@ -683,14 +853,15 @@ def _compare(
                 status,
                 str(mi + 1),
                 "UYUMLU" if toplam_ok else f"FARK ({toplam_fark:.2f})",
-                "KISMI_KDV" if kdv_special else ("UYUMLU" if kdv_ok else f"FARK ({kdv_fark:.2f})"),
-                "UYUMLU" if etiket_ok else "FARK",
+                _kdv_label(status, kdv_ok, kdv_special, kdv_fark),
+                "UYUMLU" if _etiket_ok(y_row, m_row) else "FARK",
                 note,
             )
         )
 
     for mi, m_row in enumerate(muhasebe_rows):
         if mi not in matched_muhasebe:
+            muhasebe_yok_count += 1
             note = _analyze_unmatched_reason("Muhasebe", mi + 1, m_row, yevmiye_rows, logger)
             muhasebe_result.append(
                 _build_result_row(m_row, STATUS_YOK, "", "-", "-", "-", note)
@@ -699,45 +870,36 @@ def _compare(
 
         yi = matched_muhasebe[mi]
         y_row = yevmiye_rows[yi]
-        toplam_fark = abs(_to_float(y_row.get("Toplam", 0)) - _to_float(m_row.get("Toplam", 0)))
-        kdv_fark = abs(_to_float(y_row.get("KDV", 0)) - _to_float(m_row.get("KDV", 0)))
-        toplam_ok = toplam_fark <= 1
-        kdv_ok = kdv_fark <= 1
-        y_kdv = _to_float(y_row.get("KDV", 0))
-        m_kdv = _to_float(m_row.get("KDV", 0))
-        kdv_special = m_kdv == 0 and y_kdv > 0 and toplam_ok
-        y_etiket = str(y_row.get("Etiket", "")).strip()
-        m_etiket = str(m_row.get("Etiket", "")).strip()
-        etiket_ok = (not y_etiket and not m_etiket) or (y_etiket == m_etiket)
-        fatura_ok = _normalize_fatura_no(y_row.get("Fatura No", "")) == _normalize_fatura_no(m_row.get("Fatura No", ""))
-        firma_ok = _normalize_firma(y_row.get("Firma", "")) == _normalize_firma(m_row.get("Firma", ""))
-        if yi in last_chance_match_keys:
-            status = STATUS_FARK
-            note = "son hane eşleşmesi ile bulundu"
-        else:
-            status = STATUS_TAM if (toplam_ok and kdv_ok and etiket_ok) else STATUS_FARK
-        if status == STATUS_TAM:
-            note = "Tüm kontroller uyumlu"
-        elif kdv_special:
-            note = "yevmiye tarafında kısmi/ek KDV var"
-        elif yi not in last_chance_match_keys:
-            note = "Kontrol farkı var"
+        status, note, fatura_ok, firma_ok, toplam_ok, kdv_ok, kdv_special, toplam_fark, kdv_fark = (
+            _evaluate_match(y_row, m_row, is_last_chance=yi in last_chance_match_keys)
+        )
         muhasebe_result.append(
             _build_result_row(
                 {**m_row, "_fatura_ok": fatura_ok, "_firma_ok": firma_ok},
                 status,
                 str(yi + 1),
                 "UYUMLU" if toplam_ok else f"FARK ({toplam_fark:.2f})",
-                "KISMI_KDV" if kdv_special else ("UYUMLU" if kdv_ok else f"FARK ({kdv_fark:.2f})"),
-                "UYUMLU" if etiket_ok else "FARK",
+                _kdv_label(status, kdv_ok, kdv_special, kdv_fark),
+                "UYUMLU" if _etiket_ok(y_row, m_row) else "FARK",
                 note,
             )
         )
 
     logger.info("Kaç tam uyum var: %s", tam_count)
+    logger.info("Kaç tevkifat uyum var: %s", tevkifat_count)
+    logger.info("Kaç istisna uyum var: %s", istisna_count)
     logger.info("Kaç fark var: %s", fark_count)
-    logger.info("Kaç eşleşme yok: %s", yok_count)
-    return yevmiye_result, muhasebe_result
+    logger.info("Kaç eşleşme yok (yevmiye): %s", yok_count)
+    logger.info("Kaç eşleşme yok (muhasebe/excel): %s", muhasebe_yok_count)
+    stats = {
+        "tam_uyumlu": tam_count,
+        "tevkifat_uyumlu": tevkifat_count,
+        "istisna_uyumlu": istisna_count,
+        "fark_var": fark_count,
+        "eslesme_yok_yevmiye": yok_count,
+        "eslesme_yok_muhasebe": muhasebe_yok_count,
+    }
+    return yevmiye_result, muhasebe_result, stats
 
 
 def _sort_yevmiye_rows_for_sheet(rows: list[dict]) -> list[dict]:
@@ -756,7 +918,14 @@ def _sort_yevmiye_rows_for_sheet(rows: list[dict]) -> list[dict]:
     return sorted_rows
 
 
-def _write_sheet(writer: pd.ExcelWriter, sheet_name: str, rows: list[dict], logger: logging.Logger) -> None:
+def _write_sheet(
+    writer: pd.ExcelWriter,
+    sheet_name: str,
+    rows: list[dict],
+    logger: logging.Logger,
+    *,
+    verbose_cell_log: bool = False,
+) -> None:
     df = pd.DataFrame(rows, columns=RESULT_COLUMNS)
     df.to_excel(writer, index=False, sheet_name=sheet_name)
     ws = writer.sheets[sheet_name]
@@ -764,21 +933,27 @@ def _write_sheet(writer: pd.ExcelWriter, sheet_name: str, rows: list[dict], logg
     for cell in ws[1]:
         cell.font = Font(bold=True)
 
+    painted = 0
     for row_idx in range(2, ws.max_row + 1):
         status = ws.cell(row=row_idx, column=10).value
         fill = _status_fill(str(status))
         for col_idx in range(1, ws.max_column + 1):
             ws.cell(row=row_idx, column=col_idx).fill = fill
 
-        # Eşleşen satırlarda (TAM_UYUMLU/FARK_VAR) doğru alanları hücre bazında yeşil göster.
-        if str(status) in {STATUS_TAM, STATUS_FARK}:
+        # Eşleşen satırlarda doğru alanları hücre bazında yeşil göster.
+        if str(status) in UYUMLU_STATUSES | {STATUS_FARK}:
             toplam_kontrol = str(ws.cell(row=row_idx, column=12).value or "").strip().upper()
             kdv_kontrol = str(ws.cell(row=row_idx, column=13).value or "").strip().upper()
             etiket_kontrol = str(ws.cell(row=row_idx, column=14).value or "").strip().upper()
             eslesen_no = ws.cell(row=row_idx, column=11).value
             fatura_ok = False
             firma_ok = False
-            kdv_ok = kdv_kontrol.startswith("OK") or kdv_kontrol.startswith("UYUMLU")
+            kdv_ok = (
+                kdv_kontrol.startswith("OK")
+                or kdv_kontrol.startswith("UYUMLU")
+                or kdv_kontrol.startswith("TEVKIFAT")
+                or kdv_kontrol.startswith("ISTISNA")
+            )
             toplam_ok = toplam_kontrol.startswith("OK") or toplam_kontrol.startswith("UYUMLU")
             etiket_ok = etiket_kontrol.startswith("OK") or etiket_kontrol.startswith("UYUMLU")
 
@@ -799,16 +974,19 @@ def _write_sheet(writer: pd.ExcelWriter, sheet_name: str, rows: list[dict], logg
                 ws.cell(row=row_idx, column=7).fill = FILL_GREEN  # Toplam
             if etiket_ok:
                 ws.cell(row=row_idx, column=8).fill = FILL_GREEN  # Etiket
+            painted += 1
+            if verbose_cell_log:
+                logger.info(
+                    "Hücre boyama: satır %s | fatura=%s firma=%s kdv=%s toplam=%s etiket=%s",
+                    row_idx - 1,
+                    fatura_ok,
+                    firma_ok,
+                    kdv_ok,
+                    toplam_ok,
+                    etiket_ok,
+                )
 
-            logger.info(
-                "Hücre boyama: satır %s | fatura=%s firma=%s kdv=%s toplam=%s etiket=%s",
-                row_idx - 1,
-                fatura_ok,
-                firma_ok,
-                kdv_ok,
-                toplam_ok,
-                etiket_ok,
-            )
+    logger.info("Hücre boyama tamamlandı: sheet=%s satır=%s", sheet_name, painted)
 
     for col_idx, col_name in enumerate(RESULT_COLUMNS, start=1):
         values = df[col_name].astype(str).tolist() if not df.empty else []
@@ -816,13 +994,50 @@ def _write_sheet(writer: pd.ExcelWriter, sheet_name: str, rows: list[dict], logg
         ws.column_dimensions[get_column_letter(col_idx)].width = min(max_len + 2, 80)
 
 
+def _write_ozet_sheet(
+    writer: pd.ExcelWriter,
+    result: ReconciliationResult,
+) -> None:
+    rows = [
+        ("Ay", result.ay_ismi),
+        ("Yevmiye satır sayısı", result.yevmiye_count),
+        ("Excel (gider+gelir) satır sayısı", result.muhasebe_count),
+        ("TAM_UYUMLU (birebir)", result.tam_uyumlu),
+        ("TEVKIFAT_UYUMLU", result.tevkifat_uyumlu),
+        ("ISTISNA_UYUMLU", result.istisna_uyumlu),
+        ("Uyumlu toplam (TAM+TEVKIFAT+ISTISNA)", result.uyumlu_toplam),
+        ("FARK_VAR", result.fark_var),
+        ("ESLESME_YOK (yevmiye)", result.eslesme_yok_yevmiye),
+        ("ESLESME_YOK (excel)", result.eslesme_yok_muhasebe),
+        ("Uyum oranı (%)", result.birebir_orani),
+        (
+            "Sonuç",
+            (
+                "Kayıtlar örtüşüyor"
+                if result.eslesme_yok_yevmiye == 0
+                and result.eslesme_yok_muhasebe == 0
+                and result.fark_var == 0
+                and result.yevmiye_count > 0
+                else "Fark veya eksik kayıt var — detay sekmelerini inceleyin"
+            ),
+        ),
+    ]
+    df = pd.DataFrame(rows, columns=["Metrik", "Değer"])
+    df.to_excel(writer, index=False, sheet_name="Ozet")
+    ws = writer.sheets["Ozet"]
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+    ws.column_dimensions["A"].width = 40
+    ws.column_dimensions["B"].width = 70
+
+
 def run_reconciliation(
     yevmiye_file_path: str,
     gider_file_path: str,
-    gelir_file_path: str,
+    gelir_file_path: str | None,
     output_dir: str,
     logger: logging.Logger,
-) -> str:
+) -> ReconciliationResult:
     os.makedirs(output_dir, exist_ok=True)
     ay_ismi, ay_kaynagi = _resolve_ay_for_output(
         yevmiye_file_path, gider_file_path, gelir_file_path
@@ -835,7 +1050,7 @@ def run_reconciliation(
         run_file_handler = attach_run_file_log(logger, run_log_path)
         logger.info("Seçilen yevmiye dosyası: %s", yevmiye_file_path)
         logger.info("Seçilen gider dosyası: %s", gider_file_path)
-        logger.info("Seçilen gelir dosyası: %s", gelir_file_path)
+        logger.info("Seçilen gelir dosyası: %s", gelir_file_path or "(yok)")
         logger.info("Seçilen çıktı klasörü: %s", output_dir)
         logger.info("Ay tespiti: %s kaynağından alındı (%s)", ay_kaynagi, ay_ismi)
         logger.info("Kontrol çıktı klasörü: %s", kontrol_dir)
@@ -854,15 +1069,38 @@ def run_reconciliation(
             logger=logger,
         )
         matches.update(last_chance_matches)
-        yevmiye_result, muhasebe_result = _compare(
+        yevmiye_result, muhasebe_result, stats = _compare(
             yevmiye_rows, muhasebe_rows, matches, set(last_chance_matches.keys()), logger
         )
         yevmiye_result_sorted = _sort_yevmiye_rows_for_sheet(yevmiye_result)
+
+        result = ReconciliationResult(
+            output_dir=kontrol_dir,
+            ay_ismi=ay_ismi,
+            yevmiye_count=len(yevmiye_rows),
+            muhasebe_count=len(muhasebe_rows),
+            tam_uyumlu=stats["tam_uyumlu"],
+            tevkifat_uyumlu=stats["tevkifat_uyumlu"],
+            istisna_uyumlu=stats["istisna_uyumlu"],
+            fark_var=stats["fark_var"],
+            eslesme_yok_yevmiye=stats["eslesme_yok_yevmiye"],
+            eslesme_yok_muhasebe=stats["eslesme_yok_muhasebe"],
+        )
 
         logger.info("Birleşmiş excel toplam satır sayısı: %s", len(muhasebe_rows))
         logger.info("2. sekmeye yazılan satır sayısı: %s", len(muhasebe_result))
         logger.info("Yevmiye özet toplam satır sayısı: %s", len(yevmiye_rows))
         logger.info("1. sekmeye yazılan satır sayısı: %s", len(yevmiye_result_sorted))
+        logger.info(
+            "Özet: TAM=%s TEVKIFAT=%s ISTISNA=%s FARK=%s YOK_yevmiye=%s YOK_excel=%s oran=%%%s",
+            result.tam_uyumlu,
+            result.tevkifat_uyumlu,
+            result.istisna_uyumlu,
+            result.fark_var,
+            result.eslesme_yok_yevmiye,
+            result.eslesme_yok_muhasebe,
+            result.birebir_orani,
+        )
 
         if len(muhasebe_rows) != len(muhasebe_result):
             logger.warning(
@@ -881,15 +1119,17 @@ def run_reconciliation(
 
         detay_path = os.path.join(kontrol_dir, f"yevmiye_kontrol_detay_{ay_ismi}.xlsx")
         with pd.ExcelWriter(detay_path, engine="openpyxl") as writer:
+            _write_ozet_sheet(writer, result)
             _write_sheet(writer, "Yevmiye_Kontrol", yevmiye_result_sorted, logger)
         logger.info("ayrı dosya üretildi: yevmiye_kontrol_detay_%s.xlsx", ay_ismi)
 
         birlesik_path = os.path.join(kontrol_dir, f"birlestirilmis_excel_{ay_ismi}.xlsx")
         with pd.ExcelWriter(birlesik_path, engine="openpyxl") as writer:
+            _write_ozet_sheet(writer, result)
             _write_sheet(writer, "Birlestirilmis_Excel", muhasebe_result, logger)
         logger.info("ayrı dosya üretildi: birlestirilmis_excel_%s.xlsx", ay_ismi)
 
-        return kontrol_dir
+        return result
     finally:
         if run_file_handler is not None:
             detach_run_file_log(logger, run_file_handler)
